@@ -26,7 +26,8 @@ import joblib
 import numpy as np
 import pandas as pd
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import Query
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # =====================================================================================================
 # Core logic (identical to the notebook)
@@ -298,13 +299,22 @@ class BadInput(Exception):
     pass
 
 
+def _default_week():
+    """Monday of the upcoming week, by today's date (set FORECAST_FROM_DATA_END=1 to use the week after the
+    data ends instead, i.e. 2016-05-23 for the M5 data)."""
+    if os.environ.get("FORECAST_FROM_DATA_END") == "1":
+        return BUNDLE["next_week_start"]
+    today = pd.Timestamp.today().normalize()
+    return str((today + pd.Timedelta(days=7 - today.weekday())).date())
+
+
 def _week_start(ws):
     if ws is None:
-        return BUNDLE["next_week_start"]
+        return _default_week()
     try:
         t = pd.Timestamp(ws)
     except Exception:
-        raise BadInput("week_start must be a date like 2016-05-23")
+        raise BadInput("week_start must be a date like 2026-11-23")
     if t.weekday() != 0:
         raise BadInput("week_start must be a Monday (weeks run Monday-Sunday)")
     return str(t.date())
@@ -347,7 +357,7 @@ def do_model_info():
     b = BUNDLE
     return {"model": b["model_name"], "features": b["features"], "n_products": len(b["products"]),
             "stores": b["store_region"], "data_through_week": b["last_history_week"],
-            "default_forecast_week": b["next_week_start"], "accuracy": b["accuracy"],
+            "default_forecast_week": _default_week(), "data_through_note": "Sales history in the model ends at data_through_week; forecasts for later dates start from that history's level.", "accuracy": b["accuracy"],
             "comparison": b["comparison"]}
 
 
@@ -371,7 +381,7 @@ def do_predict(product_id, store_id, recent_weekly_sales=None, week_start=None, 
 def do_seasonality(product_id, store_id, n_weeks=8):
     _, region, _, key = _resolve(product_id, store_id, None)
     s = BUNDLE["seasonality"][key]
-    out = seasonality_analysis(s["month"], s["dow"], BUNDLE["next_week_start"], n_weeks)
+    out = seasonality_analysis(s["month"], s["dow"], _default_week(), n_weeks)
     out.update({"product_id": product_id, "store_id": store_id, "region": region,
                 "basis": "Month index = 90% chain-wide pattern + 10% product-region pattern (store-level monthly "
                          "patterns were too noisy to beat 'no seasonality' in a backtest). Day-of-week index is "
@@ -384,13 +394,14 @@ def do_regional(product_id):
         raise NotFound(f"unknown product '{product_id}'. Use GET /products.")
     b = BUNDLE
     hs = {s: b["history"][f"{product_id}|{s}"] for s in b["store_region"]}
-    nf = {s: _fc(hs[s], b["store_region"][s], b["next_week_start"], 1)[0] for s in hs}
+    fw = _default_week()
+    nf = {s: _fc(hs[s], b["store_region"][s], fw, 1)[0] for s in hs}
     out = regional_analysis(hs, b["store_region"], nf)
-    out.update({"product_id": product_id, "forecast_week": b["next_week_start"]})
+    out.update({"product_id": product_id, "forecast_week": fw})
     return out
 
 
-def do_volatility(product_id, store_id, recent_weekly_sales=None):
+def do_volatility(product_id, store_id, recent_weekly_sales=None, week_start=None):  # week_start unused
     hist, region, _, _ = _resolve(product_id, store_id, recent_weekly_sales)
     out = volatility_analysis(hist, BUNDLE["volatility_thresholds"])
     out.update({"product_id": product_id, "store_id": store_id, "region": region})
@@ -483,58 +494,100 @@ app = FastAPI(title="Demand Forecast & Inventory Analytics API", version="3.0.0"
                           "user-supplied available stock and lead time.")
 
 
+_PRODUCTS = list(BUNDLE["products"])
+_STORES = list(BUNDLE["store_region"])
+_PLACEHOLDERS = {"", "string", "null", "none"}
+
+
 class Base(BaseModel):
-    product_id: str = Field(..., examples=["FOODS_1_018"])
-    store_id: str = Field(..., examples=["CA_1"])
+    """Request body. product_id / store_id show as dropdowns in /docs. Optional fields can simply be left out;
+    placeholder values that /docs may fill in ("string", [0], empty list) are treated as 'not sent'."""
+    product_id: str = Field(..., examples=["FOODS_1_018"], json_schema_extra={"enum": _PRODUCTS})
+    store_id: str = Field(..., examples=["CA_1"], json_schema_extra={"enum": _STORES})
     recent_weekly_sales: Optional[List[float]] = Field(
-        None, description="Optional last >=13 weekly unit totals, oldest first. Omit to use stored history.")
+        None, description="Optional: last 13 weekly unit totals, oldest first. Leave out to use stored history.",
+        )
+    week_start: Optional[str] = Field(
+        None, description="Optional: Monday of the first forecast week (YYYY-MM-DD). Leave out to forecast the "
+                          "upcoming week from today's date.")
+
+    @field_validator("week_start", mode="before")
+    @classmethod
+    def _clean_week(cls, v):
+        if v is None or (isinstance(v, str) and v.strip().lower() in _PLACEHOLDERS):
+            return None
+        return v
+
+    @field_validator("recent_weekly_sales", mode="before")
+    @classmethod
+    def _clean_hist(cls, v):
+        if v is None or v == [] or (isinstance(v, list) and len(v) < 2 and all(x in (0, "string") for x in v)):
+            return None
+        return v
+
+
+def _ex(**kw):
+    return ConfigDict(json_schema_extra={"examples": [{"product_id": "FOODS_1_018", "store_id": "CA_1", **kw}]})
 
 
 class PredictRequest(Base):
-    week_start: Optional[str] = Field(None, description="Monday of the first forecast week, YYYY-MM-DD")
+    model_config = _ex(horizon_weeks=4)
     horizon_weeks: int = Field(1, ge=1, le=12)
 
 
 class VolatilityRequest(Base):
-    pass
+    model_config = _ex()
 
 
 class StockoutRequest(Base):
+    model_config = _ex(available_stock=120, lead_time_days=10)
     available_stock: float = Field(..., ge=0, description="Units on hand")
     lead_time_days: float = Field(..., gt=0, le=120, description="Days until a new order arrives")
     service_level: float = Field(0.95, gt=0.5, lt=0.999)
     review_days: int = Field(7, ge=0, le=60, description="Extra days of cover to order for")
-    week_start: Optional[str] = None
 
 
 class DepletionRequest(Base):
+    model_config = _ex(available_stock=120, lead_time_days=10)
     available_stock: float = Field(..., ge=0)
     lead_time_days: Optional[float] = Field(None, gt=0, le=120, description="Optional: adds reorder date and shortfall")
     horizon_days: int = Field(56, ge=7, le=120, description="How far ahead to simulate")
     service_level: float = Field(0.95, gt=0.5, lt=0.999)
-    week_start: Optional[str] = None
+
+    @field_validator("lead_time_days", mode="before")
+    @classmethod
+    def _zero_lead(cls, v):
+        return None if v in (0, "", "string") else v
 
 
 class OverstockRequest(Base):
+    model_config = _ex(available_stock=5000, lead_time_days=7)
     available_stock: float = Field(..., ge=0)
     lead_time_days: float = Field(7, gt=0, le=120)
     extra_weeks: float = Field(4, ge=0, le=26, description="Weeks of demand allowed above the reorder point")
     service_level: float = Field(0.95, gt=0.5, lt=0.999)
-    week_start: Optional[str] = None
 
 
 class ReportRequest(Base):
+    model_config = _ex(available_stock=120, lead_time_days=10)
     available_stock: float = Field(..., ge=0)
     lead_time_days: float = Field(..., gt=0, le=120)
     service_level: float = Field(0.95, gt=0.5, lt=0.999)
     review_days: int = Field(7, ge=0, le=60)
     extra_weeks: float = Field(4, ge=0, le=26)
-    week_start: Optional[str] = None
+
+
+DATA_NOTE = ("Forecast starts from the stored M5 sales history (ends {end}), because no newer sales were sent. "
+             "Send recent_weekly_sales (last 13 weekly totals) to base it on current sales.")
 
 
 def _run(fn, **kw):
     try:
-        return fn(**kw)
+        res = fn(**kw)
+        if isinstance(res, dict) and not kw.get("recent_weekly_sales") and "product_id" in kw \
+                and "store_id" in kw:
+            res["note"] = DATA_NOTE.format(end=BUNDLE["last_history_week"])
+        return res
     except NotFound as e:
         raise HTTPException(404, str(e))
     except (BadInput, ValueError) as e:
@@ -575,12 +628,14 @@ def predict(req: PredictRequest):
 
 
 @app.get("/seasonality")
-def seasonality(product_id: str, store_id: str, n_weeks: int = 8):
+def seasonality(product_id: str = Query("FOODS_1_018", json_schema_extra={"enum": _PRODUCTS}),
+                store_id: str = Query("CA_1", json_schema_extra={"enum": _STORES}),
+                n_weeks: int = Query(8, ge=1, le=26)):
     return _run(do_seasonality, product_id=product_id, store_id=store_id, n_weeks=n_weeks)
 
 
 @app.get("/regional-analysis")
-def regional_analysis_endpoint(product_id: str):
+def regional_analysis_endpoint(product_id: str = Query("FOODS_1_018", json_schema_extra={"enum": _PRODUCTS})):
     return _run(do_regional, product_id=product_id)
 
 
